@@ -1,0 +1,37 @@
+:root {color-scheme:light dark; --ink:#172034; --muted:#4c596e; --page:#f3f5f8; --panel:#ffffff; --line:#dae0e9; --control-border:#7e899b; --wash:#edf0fc; --accent:#354980; --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s6:24px; --s8:32px; --small:14px; --body:16px; --heading:20px; --radius:16px; --compact:6px; font-family:system-ui,sans-serif; color:var(--ink); background:var(--page)}
+@media(prefers-color-scheme:dark) {:root {--ink:#e6ebf4; --muted:#b3bfd1; --page:#101621; --panel:#1b2433; --line:#43516a; --control-border:#7e899b; --wash:#303e58; --accent:#aec5ff}}
+* {box-sizing:border-box} [hidden] {display:none!important}
+body {margin:0; padding:var(--s8) var(--s4); font-size:var(--body); line-height:1.6}
+main {max-width:1280px; margin:auto} header {max-width:960px}
+h1 {font-size:clamp(24px,4vw,36px); letter-spacing:-.03em; margin:0 0 var(--s3); line-height:1.2}
+h2 {font-size:var(--heading); line-height:1.4; margin:0 0 var(--s2); overflow-wrap:anywhere}
+p {margin:var(--s2) 0} .eyebrow {font-size:var(--small); letter-spacing:.08em; color:var(--muted)}
+section {background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); margin-top:var(--s6); padding:var(--s6)}
+.muted,.path {color:var(--muted); font-size:var(--small)} .path {overflow-wrap:anywhere}
+.controls {display:grid; grid-template-columns:2fr 1.4fr 1fr 1fr; gap:var(--s4)}
+label {display:block; font-size:var(--small); font-weight:600; min-width:0}
+select,input,button {font:inherit; color:var(--ink); accent-color:var(--accent)}
+select,input[type=number],button {background:var(--panel); border:1px solid var(--control-border); border-radius:var(--compact); min-height:44px; padding:var(--s2) var(--s3)}
+select,input[type=number] {display:block; width:100%; min-width:0; margin-top:var(--s1)}
+input[type=range] {width:100%; margin:var(--s2) 0; min-height:44px}
+button {cursor:pointer} button:hover:not(:disabled),button:active:not(:disabled) {background:var(--wash)}
+button:disabled {color:var(--muted); background:var(--page); cursor:default}
+:focus-visible {outline:3px solid var(--accent); outline-offset:3px}
+.slider-label {margin-top:var(--s4)} output {font-weight:400; margin-left:var(--s2)}
+.transport {display:flex; align-items:center; flex-wrap:wrap; gap:var(--s2)}
+.frames {display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:var(--s4); margin-top:var(--s6)}
+figure {margin:0; min-width:0} figure h2 {font-size:var(--body); min-height:3em}
+.image-box {aspect-ratio:4/3; background:var(--page); border-radius:var(--compact); overflow:hidden}
+img {width:100%; height:100%; display:block; object-fit:contain}
+.readout {font-variant-numeric:tabular-nums; overflow-wrap:anywhere}
+svg {width:100%; max-height:96px; display:block; margin:var(--s3) 0; overflow:visible}
+svg line {stroke:var(--line); stroke-width:3} svg circle {fill:var(--accent)}
+svg path {fill:var(--ink)} svg text {fill:var(--ink); font-size:var(--small)}
+.table-scroll {overflow:auto; max-height:320px; margin-top:var(--s4)}
+table {border-collapse:collapse; width:100%; white-space:nowrap; font-size:var(--small)}
+th,td {text-align:left; padding:var(--s2) var(--s3); border-bottom:1px solid var(--line)}
+th {background:var(--panel); position:sticky; top:0} td {font-family:ui-monospace,monospace}
+tr[aria-current=true] {background:var(--wash)}
+@media(max-width:1000px) {.controls {grid-template-columns:repeat(2,minmax(0,1fr))}}
+a {color:var(--accent)}
+@media(max-width:760px) {:root {--body:17px; --small:15px} body {padding:var(--s4) var(--s3)} section {padding:var(--s4)} .frames,.controls {grid-template-columns:1fr} figure h2 {min-height:0} .frames {gap:var(--s6)}}

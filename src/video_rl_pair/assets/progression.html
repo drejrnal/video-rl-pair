@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Offline inspection of sampled video alignment and return progression.">
+<title>Video alignment progression</title><style>@@STYLE@@</style></head>
+<body><main>
+<header><a href="index.html">Back to alignment diagnostics</a><p class="eyebrow">VIDEO PAIR DIAGNOSTICS</p><h1>Alignment progression</h1>
+<p>Keep a reference moment in view. Follow a sampled chunk in the other video, then inspect where each frame returns.</p>
+<p id="provenance" class="muted"></p></header>
+<p id="empty" hidden>No video pairs are available in this report. Increase the visual pair selection and rerun evaluation to inspect progression.</p>
+<div id="viewer">
+<section aria-label="Alignment controls">
+<div class="controls">
+<label>Video pair<select id="pair"></select></label>
+<label>Reference video R<select id="direction"><option value="source">Source as reference</option><option value="target">Target as reference</option></select></label>
+<label>Alignment method<select id="method"></select></label>
+<label>Requested horizon H<input id="horizon" type="number" min="1" step="1" value="1"></label>
+</div>
+<label class="slider-label" for="query">Query sampled index t <output id="query-value" for="query"></output></label>
+<input id="query" type="range" min="0" max="0" value="0" step="1">
+<p id="cycle" class="readout"></p>
+</section>
+<section aria-label="Retrieved frame progression">
+<div class="transport"><button id="previous" type="button">Previous step</button><button id="play" type="button">Play</button><button id="next" type="button">Next step</button><span class="muted">2 sampled steps / second · not native video FPS</span></div>
+<label class="slider-label" for="step">Chunk step i <output id="step-value" for="step"></output></label>
+<input id="step" type="range" min="0" max="0" value="0" step="1">
+<p id="chunk" class="muted"></p>
+<div class="frames">
+<figure><h2>Original reference · R[t]</h2><div class="image-box"><img id="original-image" alt=""></div><figcaption><p id="original-path" class="path"></p><p id="original-caption" class="readout"></p></figcaption></figure>
+<figure><h2>Intermediate · D[q+i]</h2><div class="image-box"><img id="middle-image" alt=""></div><figcaption><p id="middle-path" class="path"></p><p id="middle-caption" class="readout"></p></figcaption></figure>
+<figure><h2>Retrieved return · R[back[q+i]]</h2><div class="image-box"><img id="return-image" alt=""></div><figcaption><p id="return-path" class="path"></p><p id="return-caption" class="readout"></p></figcaption></figure>
+</div>
+<p id="jump" class="readout" aria-live="off"></p>
+<svg id="timeline" viewBox="0 0 600 72" role="img" aria-label="Reference query and retrieved return positions"><line x1="20" y1="35" x2="580" y2="35"/><circle id="query-marker" cy="35" r="7"/><path id="return-marker"/><text id="query-marker-label" x="20" y="16"></text><text id="return-marker-label" x="20" y="66"></text></svg>
+<p class="muted">All panels show retrieved frames, not generated predictions. Inspect the intermediate frame for semantic correspondence. Orderly DTW or normalized-time results alone do not prove correct alignment.</p>
+</section>
+<section aria-label="Progression index sequence"><h2>Unsmoothed return sequence</h2><p class="muted">Negative, repeated, and large index changes remain visible. Timestamps are seconds in the original video.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Scrollable sampled progression table"><table><thead><tr><th scope="col">Step i</th><th scope="col">D index</th><th scope="col">D time (s)</th><th scope="col">R return</th><th scope="col">R time (s)</th><th scope="col">Δ R index</th><th scope="col">Δ R time (s)</th></tr></thead><tbody id="sequence"></tbody></table></div>
+</section></div>
+<noscript>This offline viewer needs JavaScript enabled to inspect embedded frames.</noscript>
+</main><script id="progression-data" type="application/json">@@DATA@@</script>
+<script>@@LOGIC@@</script><script>@@APP@@</script></body></html>
