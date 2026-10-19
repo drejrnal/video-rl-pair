@@ -2,6 +2,7 @@ defaults:
   - model: paper
   - loss: paper
   - train: paper
+  - wandb: default
   - override hydra/job_logging: stdout
   - override hydra/hydra_logging: disabled
   - _self_

@@ -52,6 +52,63 @@ The base configuration uses 20 moments, 2 context frames, 224-pixel images,
 128-dimensional embeddings, and 4 same-action videos per local batch. The MP4
 preset uses 2 videos (one explicit pair) per local batch.
 
+## Weights & Biases tracking
+
+W&B is optional and disabled by default. Install the extra and authenticate once
+on the training machine (or supply `WANDB_API_KEY` through its environment):
+
+```bash
+uv sync --extra wandb
+uv run --extra wandb wandb login
+```
+
+Enable tracking on any training command, including your R3M checkpoint overrides:
+
+```bash
+uv run --extra wandb python -m video_rl_pair.train --config-name franka \
+  wandb.mode=online wandb.project=video-rl-pair wandb.name=franka-run
+```
+
+The settings live in `src/video_rl_pair/conf/wandb/default.yaml`:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `wandb.mode` | `disabled` | `online` uploads; `offline` records locally; `disabled` does not import W&B |
+| `wandb.project` | `video-rl-pair` | Destination W&B project |
+| `wandb.entity` | `null` | Optional account or team |
+| `wandb.name` / `wandb.group` | `null` | Display name and experiment grouping |
+| `wandb.tags` | `[]` | Labels, e.g. `'wandb.tags=[franka,r3m]'` |
+| `wandb.dir` | `${train.output_dir}` | Parent of the local `wandb/` directory |
+| `wandb.id` / `wandb.resume` | `null` | Explicit online run ID and `allow`, `must`, or `never` resume policy |
+
+Only global rank zero opens a run. At `train.log_every` and the final step it logs
+`train/total`, `train/alignment`, `train/cycle`, and `train/regularization`, averaged
+across ranks and accumulation batches. Charts use `train/step`, the optimizer step.
+The resolved Hydra configuration and world size are recorded. Automatic post-training
+evaluation logs macro and per-task diagnostics under `eval/`, including the time
+baseline. These are alignment diagnostics, not annotated semantic accuracy.
+Standalone `video_rl_pair.evaluate` continues to write local reports only.
+
+For a local check without authentication or network access:
+
+```bash
+uv run --extra wandb python -m video_rl_pair.train --config-name demo \
+  wandb.mode=offline train.output_dir=runs/wandb-demo
+```
+
+Later upload a selected offline run with
+`uv run --extra wandb wandb sync runs/wandb-demo/wandb/offline-run-<timestamp>-<id>`.
+Use the actual directory printed by W&B. Raw videos and model checkpoint files are
+not uploaded by this integration. Credentials do not belong in YAML or Git.
+
+`train.resume` restores training state; it does not select a W&B run. To continue
+the same online dashboard, also pass `wandb.mode=online wandb.id=<previous-id>
+wandb.resume=must`, with the same project/entity. Without an explicit ID, a new
+tracking run is created. Offline resume of a W&B run is not supported; start a new
+offline segment when resuming training. Runs are finalized on completion or error.
+SDK initialization/transport errors produce a warning and leave local training
+logs available; a missing optional SDK similarly falls back to local logging.
+
 ## Follow one pair through the loss
 
 For embeddings `X: [M,D]` and `Y: [N,D]`:
@@ -260,6 +317,11 @@ also depends on deterministic kernels. A new run never overwrites an existing
 `last.pt` unless explicitly resumed.
 
 ## MP4 pairs: train and evaluate
+
+For the inspected Franka dataset, use `--config-name franka`. The preset trains on
+`hang-cup` and `open-drawer` and evaluates on held-out `pick-apple`. See
+[the Franka dataset guide](docs/franka.md) for the compatibility assessment,
+dataset path, training commands, and evaluation settings.
 
 Place demonstrations in task folders. A task can use either layout:
 

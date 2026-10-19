@@ -4,7 +4,7 @@
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Settings(BaseModel):
@@ -21,6 +21,28 @@ class WeightConfig(Settings):
     key: str | None = None
     prefix: str | None = None
     exclude_prefixes: tuple[str, ...] = ()
+
+
+class WandbConfig(Settings):
+    """Optional experiment tracking; authentication uses the W&B CLI or environment."""
+
+    mode: Literal["disabled", "offline", "online"] = "disabled"
+    project: str = Field(default="video-rl-pair", min_length=1)
+    entity: str | None = None
+    name: str | None = None
+    group: str | None = None
+    tags: tuple[str, ...] = ()
+    dir: Path = Path("runs/default")
+    id: str | None = None
+    resume: Literal["allow", "must", "never"] | None = None
+
+    @model_validator(mode="after")
+    def validate_resume(self) -> "WandbConfig":
+        """Require an explicit online run identity when requesting W&B resume."""
+        if self.resume is not None and (not self.id or self.mode != "online"):
+            message = "wandb.resume requires wandb.id and wandb.mode=online."
+            raise ValueError(message)
+        return self
 
 
 class ModelConfig(Settings):

@@ -1,0 +1,14 @@
+defaults:
+  - pairs
+  - _self_
+
+data:
+  root: ${oc.env:VIDEO_RL_PAIR_DATA_ROOT,${oc.env:HOME}/Downloads/franka_robotic_operation_video}
+  train_tasks: [hang-cup, open-drawer]
+  eval_tasks: [pick-apple]
+
+train:
+  output_dir: runs/franka
+
+evaluation:
+  positions: 80

@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 runs/
+/wandb/
 *.pt
 *.h5
 

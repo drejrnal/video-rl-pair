@@ -7,7 +7,7 @@ The unpaired interface retains the original same-task anchor pairing.
 
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Final, final
@@ -71,7 +71,12 @@ class Trainer:
         if config.train.resume is not None:
             self.restore(config.train.resume)
 
-    def fit(self, batches: Iterable[Tensor]) -> None:
+    def fit(
+        self,
+        batches: Iterable[Tensor],
+        *,
+        log_metrics: Callable[[Mapping[str, float | int]], None] | None = None,
+    ) -> None:
         """Consume accumulate batches per optimizer step until max_steps.
 
         On resume the iterable must begin at microstep `step * accumulate`.
@@ -156,6 +161,8 @@ class Trainer:
                     LOGGER.info(json.dumps(record))
                     with (output / "metrics.jsonl").open("a") as stream:
                         _ = stream.write(json.dumps(record) + "\n")
+                    if log_metrics is not None:
+                        log_metrics(record)
             if self.step % cfg.save_every == 0 or self.step == cfg.max_steps:
                 self.save()
 

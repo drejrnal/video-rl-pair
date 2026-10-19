@@ -22,6 +22,9 @@ dependencies = [
 video-rl-pair = "video_rl_pair.train:main"
 video-rl-pair-evaluate = "video_rl_pair.evaluate:main"
 
+[project.optional-dependencies]
+wandb = ["wandb>=0.19,<1"]
+
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.8", "basedpyright>=1.21", "build>=1"]
 

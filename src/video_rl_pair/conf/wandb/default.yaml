@@ -1,0 +1,9 @@
+mode: disabled
+project: video-rl-pair
+entity: null
+name: null
+group: null
+tags: []
+dir: ${train.output_dir}
+id: null
+resume: null
