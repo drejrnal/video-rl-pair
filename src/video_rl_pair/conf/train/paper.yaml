@@ -1,0 +1,14 @@
+max_steps: 150000
+batch_size: 4
+accumulate: 1
+learning_rate: 0.0001
+l2_weight: 0.00001
+precision: fp32
+device: auto
+sync_batchnorm: true
+grad_clip: null
+seed: 42
+log_every: 100
+save_every: 30000
+output_dir: runs/default
+resume: null

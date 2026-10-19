@@ -1,0 +1,6 @@
+defaults:
+  - paper
+
+backbone: resnet50_v1
+ckpt:
+  exclude_prefixes: [layer4., fc.]

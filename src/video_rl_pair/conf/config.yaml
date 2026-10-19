@@ -1,0 +1,22 @@
+defaults:
+  - model: paper
+  - loss: paper
+  - train: paper
+  - override hydra/job_logging: stdout
+  - override hydra/hydra_logging: disabled
+  - _self_
+
+input:
+  positions: 20
+  context_frames: 2
+  context_stride: 15
+  image_size: 224
+
+batch_source: null
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+runs/
+*.pt
+*.h5
+
+.vscode/
+tests/
+assets/

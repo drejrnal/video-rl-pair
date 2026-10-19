@@ -1,0 +1,21 @@
+defaults:
+  - config
+  - _self_
+
+model:
+  conv_channels: 8
+  fc_channels: 16
+  embedding_dim: 8
+input:
+  positions: 3
+  context_frames: 2
+  image_size: 32
+train:
+  max_steps: 2
+  batch_size: 2
+  device: cpu
+  log_every: 1
+  save_every: 2
+  output_dir: runs/demo
+batch_source:
+  _target_: video_rl_pair.demo.synthetic_batches

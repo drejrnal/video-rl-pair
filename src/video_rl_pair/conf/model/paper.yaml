@@ -1,0 +1,12 @@
+backbone: resnet50_v2
+train_backbone: all
+ckpt:
+  path: null
+  scope: backbone
+  key: null
+  prefix: null
+  exclude_prefixes: []
+conv_channels: 512
+fc_channels: 512
+embedding_dim: 128
+dropout: 0.1
