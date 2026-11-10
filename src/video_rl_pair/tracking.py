@@ -97,20 +97,5 @@ def log_training(run: Run | None, metrics: Mapping[str, float | int]) -> None:
 
 
 def log_evaluation(run: Run | None, report: EvaluationReport) -> None:
-    """Log macro and task-level diagnostics, not annotation-based accuracy."""
-    if run is None:
-        return
-    metrics: dict[str, float | int] = {}
-    groups = {"macro": report.macro, **{f"task/{k}": v for k, v in report.by_task.items()}}
-    for group, methods in groups.items():
-        for method, summary in methods.items():
-            prefix = f"eval/{group}/{method}"
-            metrics[f"{prefix}/count"] = summary.count
-            metrics[f"{prefix}/tau_defined_count"] = summary.tau_defined_count
-            diagnostics = summary.diagnostics
-            metrics[f"{prefix}/mean_cosine"] = diagnostics.mean_cosine
-            metrics[f"{prefix}/unique_target_fraction"] = diagnostics.unique_target_fraction
-            metrics[f"{prefix}/cycle_time_error"] = diagnostics.cycle_time_error
-            if diagnostics.tau_b is not None:
-                metrics[f"{prefix}/tau_b"] = diagnostics.tau_b
-    log_metrics(run, metrics)
+    """Record report size without presenting path cost as semantic accuracy."""
+    log_metrics(run, {"eval/pairs": len(report.pairs)})

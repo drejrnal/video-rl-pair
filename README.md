@@ -1,504 +1,303 @@
 # video-rl-pair
 
-A small PyTorch implementation for studying **Representation Learning via Global
-Temporal Alignment and Cycle-Consistency** (Hadji, Derpanis, Jepson, CVPR 2021).
-Hydra controls the architecture, objective, training, and evaluation. MP4 pairs can
-now run through a task-folder dataset, deterministic sampling, PyTorch DataLoader,
-optimization, checkpointing, and held-out matching evaluation. A prepared-tensor
-iterable remains available for experiments and debugging.
+用 DINOv3 的逐帧 **CLS 特征**学习同一任务的两段视频之间的对应关系。
+训练目标保留 smoothDTW 与 Global Cycle-Consistency（GCC）；下游仅保留
+**余弦相似度 → 匹配代价 → 硬 DTW 全局路径 → 匹配帧图片序列**。
 
-The default encoder starts from scratch. Optional checkpoint initialization is
-configured independently of training resume. No weights are bundled or downloaded
-automatically, and this package does not import anything from `VideoAlignment`.
+要理解实现和各文件的关系，先阅读 [代码链路阅读指南](docs/code_walkthrough.md)。指南包含完整流程图、张量形状、损失计算、阶段切换和逐文件阅读顺序。
 
-## Reading order
+## 网络与三种模式
 
-| File | What to understand |
-| --- | --- |
-| [losses.py](src/video_rl_pair/losses.py) | Matching cost, SmoothMin, dynamic programming, global cycle loss |
-| [model.py](src/video_rl_pair/model.py) | How context frames become one normalized embedding per moment |
-| [backbone.py](src/video_rl_pair/backbone.py) | Preactivation ResNet50-v2, ending at Conv4c |
-| [trainer.py](src/video_rl_pair/trainer.py) | Forward pass, pair construction, backpropagation, optimizer update |
-| [conf/](src/video_rl_pair/conf/) | Paper dimensions and coefficients; smaller synthetic demo |
-| [weights.py](src/video_rl_pair/weights.py) | Optional initialization from compatible local checkpoints |
-| [distributed.py](src/video_rl_pair/distributed.py) | Process setup and reduction across GPUs |
-| [checkpoint.py](src/video_rl_pair/checkpoint.py) | Resume state, including per-rank RNG and normalization buffers |
-| [data.py](src/video_rl_pair/data.py), [video.py](src/video_rl_pair/video.py) | Task splits, MP4 decoding, context sampling, paired distributed batches |
-| [matching.py](src/video_rl_pair/matching.py) | Cosine nearest neighbors, hard DTW, timestamp baseline |
-| [evaluation.py](src/video_rl_pair/evaluation.py) | Frozen inference, pair diagnostics, equal task averages |
+初始化模型为
+[`facebook/dinov3-vitb16-pretrain-lvd1689m`](https://huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m)。
+每帧独立经过同一个 ViT，读取 768 维 CLS。不同视频共享参数；不融合不同时间的
+patch，也不向网络输入时间戳。32 帧对应 32 个向量。
 
-## Run the computation
+| `model.mode` | 匹配所用特征 | 更新的参数 |
+| --- | --- | --- |
+| `baseline` | 原始 CLS → L2 归一化，768 维 | 无，仅用于评估 |
+| `stage1`（默认） | CLS → Linear(768,512) → GELU → Linear(512,128) → L2 归一化 | 只有投影头 |
+| `stage2` | 与 stage1 相同 | 投影头、最后 N 个 ViT block 与最终 LayerNorm |
 
-Python 3.11+ is required. Install a CUDA-compatible PyTorch/torchvision pair on GPU
-machines. These commands create an isolated environment and install the package:
+`model.unfreeze_last_n` 控制 stage2 的 N，默认 2；stage1 忽略此设置。
+这里的阶段指参数训练方式，并不改变 CLS 的读取方式。建议先保留 baseline 结果，再训练
+stage1；需要更新主干时，从 stage1 检查点开始一个 stage2 新训练。
+
+训练输入为 `[P,2,T,3,H,W]`，其中 P 是视频对数，T 默认 32。编码器接收
+`[B,T,3,H,W]`，返回 `[B,T,D]`，训练损失只比较每对内部的两个序列。
+
+## 环境与预训练模型下载
+
+需要 Python 3.11+、uv，以及与训练机器兼容的 CUDA 版 PyTorch。仓库固定了
+Transformers 版本；完整依赖以 `pyproject.toml` 和 `uv.lock` 为准。
 
 ```bash
+cd /home/mxy/video-rl-pair
 uv sync --group dev
 source .venv/bin/activate
-python -m video_rl_pair.train --help
-python -m video_rl_pair.train --cfg job
-python -m video_rl_pair.train --config-name demo
-pytest -q
 ```
 
-The demo runs two CPU optimizer steps using random tensors, with the actual ResNet-v2
-backbone and a smaller head. It checks the computation; it is not meaningful video
-representation training. It writes `config.json`, `metrics.jsonl`, and `last.pt` to
-`runs/demo`. Use a different `train.output_dir` for each new run.
-
-The default configuration deliberately refuses to train without a batch source.
-Use `--config-name pairs` for the complete MP4 workflow described below.
-The base configuration uses 20 moments, 2 context frames, 224-pixel images,
-128-dimensional embeddings, and 4 same-action videos per local batch. The MP4
-preset uses 2 videos (one explicit pair) per local batch.
-
-## Weights & Biases tracking
-
-W&B is optional and disabled by default. Install the extra and authenticate once
-on the training machine (or supply `WANDB_API_KEY` through its environment):
+该模型需要先在 Hugging Face 模型页面申请并获得访问权限。下载前登录账号：
 
 ```bash
-uv sync --extra wandb
-uv run --extra wandb wandb login
+hf auth login
+bash scripts/download_dinov3.sh
 ```
 
-Enable tracking on any training command, including your R3M checkpoint overrides:
+默认完整下载到 `checkpoints/dinov3-vitb16-pretrain-lvd1689m`。也可以指定路径和
+模型仓库的提交号：
 
 ```bash
-uv run --extra wandb python -m video_rl_pair.train --config-name franka \
-  wandb.mode=online wandb.project=video-rl-pair wandb.name=franka-run
+MODEL_DIR=/data/models/dinov3-vitb16 HF_REVISION=<模型仓库的提交号> \
+  bash scripts/download_dinov3.sh
 ```
 
-The settings live in `src/video_rl_pair/conf/wandb/default.yaml`:
+`HF_REVISION` 默认 `main`；正式对比实验建议使用同一个提交号。可先用
+`bash scripts/download_dinov3.sh --dry-run` 查看下载命令。认证信息由 Hugging Face
+登录状态或 `HF_TOKEN` 环境变量提供，不写入配置文件。
 
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `wandb.mode` | `disabled` | `online` uploads; `offline` records locally; `disabled` does not import W&B |
-| `wandb.project` | `video-rl-pair` | Destination W&B project |
-| `wandb.entity` | `null` | Optional account or team |
-| `wandb.name` / `wandb.group` | `null` | Display name and experiment grouping |
-| `wandb.tags` | `[]` | Labels, e.g. `'wandb.tags=[franka,r3m]'` |
-| `wandb.dir` | `${train.output_dir}` | Parent of the local `wandb/` directory |
-| `wandb.id` / `wandb.resume` | `null` | Explicit online run ID and `allow`, `must`, or `never` resume policy |
+**训练不会自动下载权重。** `model.source` 指向包含 `config.json`、权重等文件的本地
+模型目录。检查点保存模型结构配置和完整参数，恢复训练或评估时无需重新获取初始化权重。
+初始模型、数据集和已有训练结果不随代码删除。
 
-Only global rank zero opens a run. At `train.log_every` and the final step it logs
-`train/total`, `train/alignment`, `train/cycle`, and `train/regularization`, averaged
-across ranks and accumulation batches. Charts use `train/step`, the optimizer step.
-The resolved Hydra configuration and world size are recorded. Automatic post-training
-evaluation logs macro and per-task diagnostics under `eval/`, including the time
-baseline. These are alignment diagnostics, not annotated semantic accuracy.
-Standalone `video_rl_pair.evaluate` continues to write local reports only.
+## 数据与采样
 
-For a local check without authentication or network access:
-
-```bash
-uv run --extra wandb python -m video_rl_pair.train --config-name demo \
-  wandb.mode=offline train.output_dir=runs/wandb-demo
-```
-
-Later upload a selected offline run with
-`uv run --extra wandb wandb sync runs/wandb-demo/wandb/offline-run-<timestamp>-<id>`.
-Use the actual directory printed by W&B. Raw videos and model checkpoint files are
-not uploaded by this integration. Credentials do not belong in YAML or Git.
-
-`train.resume` restores training state; it does not select a W&B run. To continue
-the same online dashboard, also pass `wandb.mode=online wandb.id=<previous-id>
-wandb.resume=must`, with the same project/entity. Without an explicit ID, a new
-tracking run is created. Offline resume of a W&B run is not supported; start a new
-offline segment when resuming training. Runs are finalized on completion or error.
-SDK initialization/transport errors produce a warning and leave local training
-logs available; a missing optional SDK similarly falls back to local logging.
-
-## Follow one pair through the loss
-
-For embeddings `X: [M,D]` and `Y: [N,D]`:
-
-1. `matching_cost`: normalize each embedding, compute cosine similarities, and
-   apply **row-wise** negative log-softmax with temperature `beta`. A row compares
-   one source moment against all destination moments.
-2. `smooth_dtw`: fill the accumulated-cost table. Each cell adds its matching cost
-   to the SmoothMin of diagonal, upper, and left predecessors. The path begins at
-   the first moments and ends at the last moments.
-3. `smooth_min`: compute `sum(softmax(-r/gamma) * r)`. This is the paper's weighted
-   average, **not** the log-sum-exp soft-DTW approximation. Autograd differentiates
-   through both the values and the weights.
-4. Repeat the cost and dynamic program in the reverse direction. Because the
-   matching probabilities are conditional, the reverse cost is recomputed;
-   transposing the forward accumulated table is not equivalent.
-5. `global_cycle_loss`: form row-wise `log_softmax(-R/alpha)` in each direction.
-   The diagonal round-trip probability is `sum_j p(Y_j|X_i) p(X_i|Y_j)`.
-   Compute its log with `logsumexp` and sum the negative logs over source moments.
-6. `AlignmentLoss`: combine the cycle loss with both final DTW costs:
-
-```text
-alignment = R_xy[-1,-1] + R_yx[-1,-1]
-cycle     = -sum_i log(sum_j p(Y_j | X_i) p(X_i | Y_j))
-total     = cycle_weight * cycle + alignment_weight * alignment
-```
-
-Defaults: `beta=0.1`, `gamma=0.1`, `alpha=1`, `cycle_weight=1`,
-`alignment_weight=0.1`. Losses are **summed over time and averaged over pairs**.
-Changing sequence length therefore changes the loss scale. The cycle is
-`X -> Y -> X`, as in the supplied text; only the alignment term is bidirectional.
-
-The prepared-tensor interface uses video 0 as the anchor against videos 1 through B-1,
-with every video in that batch belonging to one action category. The MP4 interface
-instead supplies explicit `[P,2,T,K,3,H,W]` pairs. `AlignmentLoss.from_pairs` compares
-only the two demonstrations within each pair; pairs from different tasks may share
-a minibatch without being compared. There is no pairing across distributed ranks.
-
-The dynamic program uses readable nested loops and ordinary autograd. It supports
-unequal pair lengths, but training expects the fixed number of moments in the
-configuration. No fused CUDA extension or padding/masking convention is hidden here.
-
-## Follow the encoder's tensor shapes
-
-| Operation | Shape with the paper configuration |
-| --- | --- |
-| Prepared clips | `[B,20,2,3,224,224]` |
-| Flatten frames into the 2D backbone | `[B*20*2,3,224,224]` |
-| Conv4c features | `[B*20*2,1024,14,14]` |
-| Regroup one context per sampled moment | `[B*20,1024,2,14,14]` |
-| Two 3D convolutions, each BN + ReLU | `[B*20,512,2,14,14]` |
-| Global max pool over context and space | `[B*20,512]` |
-| Two 512-unit FC layers + ReLU, dropout before each | `[B*20,512]` |
-| Projection and L2 normalization | `[B,20,128]` |
-
-Pooling never merges the 20 represented moments. For a moment at frame `t`, the
-two context frames are `[max(t-15,0), t]`. Use sorted moments and past context only.
-The MP4 loader constructs these tensors using `context_stride`. Custom tensor
-sources must follow the same contract.
-For the paper backbone, RGB floats are scaled to `[-1,1]`. Apply the preprocessing
-required by a different pretrained backbone when selecting one.
-
-Conv4c means the third block of the fourth convolutional stage. The v2 backbone
-uses preactivation bottlenecks, with downsampling at the ends of preceding stages.
-The ResNet50-v1 alternative uses torchvision's stage-three output and is an
-explicit architectural alternative, not a paper-equivalent backbone.
-
-## Optional initialization
-
-The checkpoint entry exists by default and is disabled until a path is supplied:
-
-```yaml
-model:
-  ckpt:
-    path: null
-    scope: backbone
-    key: null
-    prefix: null
-    exclude_prefixes: []
-```
-
-For a checkpoint compatible with the configured backbone, only change its path:
-
-```bash
-python -m video_rl_pair.train --config-name demo model.ckpt.path=/path/to/backbone.pt
-```
-
-Supported formats are PyTorch tensor state dictionaries (`.pt`, `.pth`, `.ckpt`)
-and `.safetensors`. The loader recognizes bare dictionaries and the common
-`state_dict`, `model_state_dict`, `model`, `encoder`, and `backbone` wrappers.
-It removes a uniform DDP `module.` prefix, and extracts a `backbone.` prefix when
-loading a backbone from a complete encoder. Other layouts can be selected explicitly:
-
-```bash
-python -m video_rl_pair.train --config-name demo \
-  model.ckpt.path=/path/to/custom.pt \
-  model.ckpt.key=network.ema model.ckpt.prefix=visual.
-```
-
-For an official torchvision ResNet50 checkpoint, select its matching preset:
-
-```bash
-python -m video_rl_pair.train --config-name demo model=resnet50 \
-  model.ckpt.path=/path/to/resnet50.pth
-```
-
-That preset explicitly excludes the unused `layer4` and `fc` keys. For real inputs,
-use the selected checkpoint's ImageNet preprocessing. For complete encoder weights,
-set `model.ckpt.scope=encoder` and match the head dimensions too. The default trains
-all parameters; `model.train_backbone=only_bn` or `frozen` requires initialization.
-
-A path cannot reconcile different architectures, tensor shapes, or arbitrary
-foreign formats. The loader checks every retained parameter and fails with the
-original incompatibility details. Keras/TensorFlow HDF5 files require a separate
-conversion before use. Adding another architecture means adding a matching
-backbone preset; compatible weights then reuse this loading entry point.
-
-## Training procedure and custom data interface
-
-The loop uses Adam at `1e-4` with epsilon `1e-7`, constant learning rate, and an
-optional `1e-5` squared-L2 penalty on the head's convolution/linear kernels and biases.
-BN parameters and backbone weights are excluded from that penalty. The mathematical
-loss is available separately without regularization. FP32 is the default;
-`train.precision=bf16` or `fp16` enables CUDA autocast for the encoder while retaining
-FP32 alignment costs and cycle probabilities. FP16 uses gradient scaling.
-
-Supply a callable returning an iterable with this signature:
-
-```python
-def make_batches(settings, runtime, start_step):
-    # Return an iterable of [B,T,K,3,H,W] floating tensors.
-    # On resume start at microstep start_step * settings.train.accumulate.
-    # Use runtime.rank/world_size to divide data across workers.
-    ...
-```
-
-Connect it using Hydra's callable target:
-
-```bash
-python -m video_rl_pair.train \
-  'batch_source={_target_:my_project.make_batches}' \
-  train.output_dir=runs/experiment
-```
-
-Every rank must yield the same number of fixed-size batches. The factory owns
-video decoding, sampling, augmentation, normalization, action grouping, and data
-cursor state when using this custom interface. The built-in MP4 path handles
-decoding, context sampling, normalization, pair grouping and deterministic resume.
-It currently uses square resizing without random spatial augmentation. The trainer checks
-tensor shape, finite loss/gradients, and synchronized source exhaustion.
-
-## Multiple GPUs and nodes
-
-With the environment activated, an eight-GPU synthetic computation check is:
-
-```bash
-GPUS_PER_NODE=8 bash scripts/train_single_node.sh --config-name demo \
-  train.device=cuda train.output_dir=runs/gpu-demo
-```
-
-For actual MP4 training, use `--config-name pairs` and the data overrides below.
-Custom tensor factories remain supported by the default configuration.
-The launcher uses one DDP process per GPU. The effective global sequence batch is:
-
-```text
-train.batch_size * train.accumulate * total_number_of_GPUs
-```
-
-For the MP4 preset, `batch_size=2` means one pair per GPU: eight GPUs give global
-batch 16 videos and eight pairs per microstep. `batch_size` must be even; for example,
-4 videos means two explicit pairs per GPU. The anchor-batch interface instead gives
-B-1 pairs per local batch. DDP averages gradients; accumulation divides each local loss by the
-accumulation count. These larger-batch runs are not reproductions of batch-4 training.
-CUDA DDP uses synchronized BN by default. Accumulation does not combine BN
-statistics across microsteps; CPU DDP uses local BN.
-
-On each node of a multi-node run, set `NNODES`, a unique zero-based `NODE_RANK`,
-the rank-zero node's `MASTER_ADDR`, a reachable `MASTER_PORT`, and `GPUS_PER_NODE`:
-
-```bash
-bash scripts/train_multi_node.sh \
-  'batch_source={_target_:my_project.make_batches}' \
-  train.output_dir=/shared/runs/experiment
-```
-
-Use matching code, environments, and configurations on every node. Rank zero writes
-metrics and checkpoints; the resume checkpoint must be readable on every node.
-Launch scripts do not allocate machines or choose network interfaces for a cluster.
-
-To resume this implementation's checkpoint:
-
-```bash
-python -m video_rl_pair.train --config-name demo \
-  train.resume=runs/demo/last.pt train.max_steps=4
-```
-
-Resume restores model, optimizer, scaler, step, per-rank torch RNG, and BN buffers.
-It requires the same world size and training configuration, except checkpoint
-initialization paths, output path, logging/saving intervals, and maximum step.
-The MP4 loader reconstructs its epoch and position from the saved optimizer step;
-it seeds sampling by epoch and pair identity without consuming model RNG. Whole
-pairs are sharded across ranks, and incomplete rank batches are dropped. Resume
-rejects changed training pair order or file size/modification metadata. Worker count
-may change. A custom batch source must restore its own cursor/RNG. Exact GPU reproducibility
-also depends on deterministic kernels. A new run never overwrites an existing
-`last.pt` unless explicitly resumed.
-
-## MP4 pairs: train and evaluate
-
-For the inspected Franka dataset, use `--config-name franka`. The preset trains on
-`hang-cup` and `open-drawer` and evaluates on held-out `pick-apple`. See
-[the Franka dataset guide](docs/franka.md) for the compatibility assessment,
-dataset path, training commands, and evaluation settings.
-
-Place demonstrations in task folders. A task can use either layout:
+数据按任务分目录，可以在同一任务内自动构建所有无序视频对：
 
 ```text
 dataset/
-  task_01/                 # all unordered pairs of these demonstrations
-    demo_a.mp4
-    demo_b.mp4
-    demo_c.mp4
-  task_02/                 # explicit pairs, exactly two MP4s per pair folder
-    pair_001/
-      first.mp4
-      second.mp4
-  task_03/
-    demo_a.mp4
-    demo_b.mp4
+  hang-cup/
+    demo_01.mp4
+    demo_02.mp4
+  open-drawer/
+    demo_01.mp4
+    demo_02.mp4
+  pick-apple/
+    demo_01.mp4
+    demo_02.mp4
 ```
 
-Mixed layouts within a task are rejected. Each pair must contain distinct files.
-Declare your 43 training task names and seven held-out task names explicitly in
-`conf/pairs.yaml` or on the command line. Counts are configurable; this smaller
-example uses two training tasks and one held-out task:
+也可以使用 `task/pair_001/{first.mp4,second.mp4}` 显式指定视频对。同一任务不能混用
+这两种目录布局。训练与评估任务列表必须分离；配置还会检查解析后的文件路径是否重叠。
+
+- **训练**：固定 32 个输入位置，包含首尾帧；内部按区间随机取不同帧，并保持时间顺序。
+  两段视频独立采样。种子由训练种子、epoch 和视频对索引确定。
+- **短视频**：使用全部有效帧，重复末帧补齐输入张量，同时记录有效长度。
+  **填充位置在计算 softmax、DTW 和循环损失前被移除**，不会增加该阶段的训练权重。
+- **评估**：均匀、确定性采样，包含首尾；最多 `evaluation.positions` 帧，不重复补齐。
+- **图像**：RGB，缩放到 `input.image_size × input.image_size`，默认 224，使用
+  ImageNet 均值 `[0.485,0.456,0.406]`、标准差 `[0.229,0.224,0.225]`。
+  正方形缩放不保持宽高比；训练与评估采用相同处理。
+
+每段视频至少两帧。首尾约束要求视频覆盖大致相同的完整动作过程；若含长时间等待或中途
+截断，优先裁好动作边界。相同的采样序号不被当作对应标签。
+
+## 默认第一阶段训练
+
+Franka 配置在 `hang-cup` 和 `open-drawer` 上训练，保留 `pick-apple` 供训练结束后检查。
+默认数据路径是 `/data/mxy/collection_datasets/franka_robotic_operation_video`。
+先用少量步骤检查环境和数据，再调整训练步数：
 
 ```bash
-uv sync --group dev
-uv run python -m video_rl_pair.train --config-name pairs \
-  data.root=/path/to/dataset \
-  'data.train_tasks=[task_01,task_02]' \
-  'data.eval_tasks=[task_03]' \
-  train.output_dir=runs/mp4-run
+GPUS=0 MAX_STEPS=100 OUTPUT_DIR=runs/franka-dinov3-check \
+  bash scripts/train_franka_dinov3.sh
+
+GPUS=0,1 MODE=stage1 MAX_STEPS=6000 \
+  BATCH_SIZE=2 NUM_WORKERS=2 OUTPUT_DIR=runs/franka-dinov3-stage1 \
+  bash scripts/train_franka_dinov3.sh
 ```
 
-This command trains, saves `runs/mp4-run/last.pt`, then evaluates that checkpoint
-on pairs **within each held-out task**. Under torchrun, only global rank zero
-evaluates after training. Use the existing node launch scripts with the same
-`--config-name pairs` and data overrides. Set `evaluation.enabled=false` to defer
-evaluation, or lower `train.max_steps` for a computation check. A real run requires
-enough pairs for one complete batch on every rank.
-
-MP4s are decoded with PyAV. Training samples sorted, stratified random moments;
-evaluation samples uniformly and deterministically. Context uses past frame indices,
-with the earliest frame repeated near the beginning. Short training videos may
-repeat sampled moments to keep T fixed; evaluation keeps unique moments and uses
-at most `evaluation.positions` frames. Each video must have at least two frames
-and valid increasing timestamps. `context_stride` is measured in decoded frames,
-so its duration changes with frame rate. Square resizing does not preserve aspect
-ratio. Normalize RGB to `[-1,1]` for the paper backbone or ImageNet mean/std for the
-torchvision preset; the loader selects this from the model configuration.
-
-There are no phase labels or event annotations. Train/eval task lists must be
-disjoint. Resolved file paths are checked for overlap, including symlinks; duplicated
-video contents stored as different files cannot be detected by this check.
-
-To evaluate a saved training checkpoint separately:
+若数据和模型位于其他位置：
 
 ```bash
-uv run python -m video_rl_pair.evaluate \
-  data.root=/path/to/dataset \
-  'data.train_tasks=[task_01,task_02]' 'data.eval_tasks=[task_03]' \
-  evaluation.checkpoint=runs/mp4-run/last.pt \
-  evaluation.output_dir=runs/mp4-run/recheck
+GPUS=0 DATA_ROOT=/data/my-videos MODEL_DIR=/data/models/dinov3-vitb16 \
+  OUTPUT_DIR=runs/my-stage1 bash scripts/train_franka_dinov3.sh \
+  'data.train_tasks=[task_a,task_b]' 'data.eval_tasks=[task_c]'
 ```
 
-Architecture, image size, and context are restored from the checkpoint. The encoder
-runs in eval mode with gradients disabled; `evaluation.chunk_size` bounds inference
-memory. `evaluation.positions` controls the number of sampled evaluation moments.
-No annotation or test score is used to choose the training checkpoint: automatic
-evaluation uses the final checkpoint, not the best score on the held-out tasks.
+脚本从任意目录调用都可以；相对路径按仓库根目录解释。先运行
+`GPUS=0 bash scripts/train_franka_dinov3.sh --dry-run` 可以查看最终命令。
+`bash scripts/train_franka_dinov3.sh --help` 列出全部环境变量。
 
-To compare against initialization, run the same evaluation command with
-`evaluation.checkpoint=null evaluation.allow_initialization=true` and a fresh output
-directory. Set the same model dimensions/initialization path used before training;
-the timestamp-only baseline is always included automatically. Use the same task
-lists, evaluation seed, positions, and pair cap for comparisons.
+不使用启动脚本时，相同的配置可以直接执行：
 
-### Reading the evaluation output
+```bash
+python -m video_rl_pair.train --config-name franka \
+  model.mode=stage1 train.output_dir=runs/franka-stage1-direct
+```
 
-- `report.json`: selected pairs, times, directional matches, per-task diagnostics,
-  equal-weight task macro averages, and within-video embedding spread.
-- `index.html`: self-contained cosine-similarity heatmaps and matched video frames
-  with timestamps. Open locally in a browser. By default it visualizes two pairs
-  per task and evaluates up to 20 pairs per task, selected with a fixed seed.
-- `progression.html`: interactive round-trip and progression inspection for the
-  same visualized pairs, with all available matching methods selectable.
+主要配置如下。末尾的 Hydra 参数优先于脚本环境变量。
 
-Every selected pair is evaluated in both directions. Nearest-neighbor matching
-tests the embeddings directly. Hard DTW minimizes the sum of `1 - cosine` along
-a monotonic endpoint-constrained path; it is distinct from training SmoothMin.
-For a query moment with multiple path matches, select the highest-cosine candidate,
-breaking ties by earliest target. The time baseline matches normalized timestamps.
+| 配置 | 默认值 | 含义 |
+| --- | --- | --- |
+| `model.source` | `checkpoints/dinov3-vitb16-pretrain-lvd1689m` | 本地初始化模型目录 |
+| `model.mode` | `stage1` | baseline / stage1 / stage2 |
+| `model.hidden_dim` / `embedding_dim` | 512 / 128 | 投影头中间维度与输出维度 |
+| `model.unfreeze_last_n` | 2 | stage2 解冻的尾部 block 数 |
+| `input.positions` / `image_size` | 32 / 224 | 采样位置数与输入边长 |
+| `train.batch_size` | 2 | 每张 GPU 的视频数量，必须为偶数 |
+| `train.accumulate` | 1 | 每次更新累积的批次数 |
+| `train.learning_rate` | `1e-4` | 投影头学习率 |
+| `train.backbone_learning_rate` | `1e-5` | stage2 主干学习率 |
+| `train.max_steps` | 6000 | 优化器更新次数 |
+| `train.l2_weight` | `1e-5` | 投影头线性层权重、偏置的平方 L2 系数 |
+| `train.precision` | `fp32` | 可选 bf16 / fp16，需 CUDA 支持 |
+| `train.grad_clip` | 1.0 | 梯度范数裁剪上限 |
+| `train.log_every` / `save_every` | 100 / 1200 | 按优化器步骤计数的日志、保存间隔 |
+| `train.init_checkpoint` | null | 新训练加载的模型参数，例如 stage1 → stage2 |
+| `train.resume` | null | 同一阶段恢复模型、优化器、步数及随机状态 |
+| `evaluation.enabled` | true | 训练结束后执行 DTW 图片检查 |
+| `wandb.mode` | disabled | 可选 offline / online |
 
-| Diagnostic | Meaning and limitation |
+有效视频数/更新为 `batch_size × accumulate × GPU 数`，视频对数是其一半。
+输出包含 `config.json`、`metrics.jsonl`、按步数保留的 `step_XXXXXX.pt` 和最新的 `last.pt`。
+默认训练 6000 步，每 1200 步保存一次，保留 `step_001200.pt`、`step_002400.pt`、
+`step_003600.pt`、`step_004800.pt`、`step_006000.pt`；`last.pt` 更新为最新检查点。
+最后一步总会保存，即使不是保存间隔的整数倍。每个检查点都可用于恢复训练或评估。
+新训练使用新目录，避免覆盖已有检查点。
+
+使用 W&B 时，先 `uv sync --extra wandb`，再登录并设置 `WANDB_MODE=online`；
+默认关闭，不要求账号。训练日志记录 total、alignment、cycle、regularization。
+
+## 第二阶段与恢复训练
+
+从第一阶段模型初始化第二阶段，使用新目录：
+
+```bash
+GPUS=0,1 MODE=stage2 UNFREEZE_LAST_N=2 \
+  INIT_CHECKPOINT=runs/franka-dinov3-stage1/last.pt \
+  OUTPUT_DIR=runs/franka-dinov3-stage2 BACKBONE_LR=1e-5 LEARNING_RATE=1e-4 \
+  bash scripts/train_franka_dinov3.sh
+```
+
+`INIT_CHECKPOINT` 只加载模型参数，新建优化器并从第 0 步开始。
+`RESUME` 恢复同一阶段的完整训练状态，不用于切换训练阶段：
+
+```bash
+GPUS=0,1 MODE=stage1 RESUME=runs/franka-dinov3-stage1/last.pt \
+  OUTPUT_DIR=runs/franka-dinov3-stage1 MAX_STEPS=20000 \
+  bash scripts/train_franka_dinov3.sh
+```
+
+恢复要求 GPU 数、训练数据、模型和优化器配置一致；输出路径、日志/保存间隔、最大步数
+可以改变。数据文件路径、大小、修改时间和配对顺序用于检查数据是否发生变化。
+
+通用单机多 GPU 启动入口：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 GPUS_PER_NODE=2 \
+  bash scripts/train_single_node.sh --config-name franka \
+  train.output_dir=runs/franka-multi-gpu
+```
+
+多机时，在每台机器设置相同的 `NNODES`、`MASTER_ADDR`、`MASTER_PORT`、
+`GPUS_PER_NODE`，并设置不同的 `NODE_RANK`（从 0 开始），然后执行
+`bash scripts/train_multi_node.sh --config-name franka train.output_dir=/shared/runs/experiment`。
+各节点必须能访问模型、数据与恢复检查点，并采用相同环境；脚本不负责申请机器或 GPU。
+
+## 唯一的下游检查：DTW 匹配帧图片序列
+
+对两段视频得到特征序列 X、Y，计算：
+
+```text
+similarity[i,j] = cosine(X[i], Y[j])
+cost[i,j]       = 1 - similarity[i,j]
+path           = argmin_path sum(cost[i,j])
+```
+
+路径从 `(0,0)` 到 `(M-1,N-1)`，每次允许向右、向下或对角前进。
+**输出保留完整路径的每个位置**，包括一个源帧对应多个目标帧的情况，不压缩为每帧一次匹配。
+每个路径位置输出一张左右并排 PNG，标注采样位置、原始时间戳与匹配分数，按路径顺序编号。
+这里使用不可微的硬 DTW；训练使用 smoothDTW，两者不是相同的运算。
+
+先对同一视频对运行未经训练的 CLS 基线：
+
+```bash
+python -m video_rl_pair.evaluate \
+  model.mode=baseline \
+  model.source=checkpoints/dinov3-vitb16-pretrain-lvd1689m \
+  evaluation.source=/path/to/first.mp4 \
+  evaluation.target=/path/to/second.mp4 \
+  evaluation.output_dir=runs/compare-baseline
+```
+
+再评估训练后的模型：
+
+```bash
+python -m video_rl_pair.evaluate \
+  evaluation.checkpoint=runs/franka-dinov3-stage1/last.pt \
+  evaluation.source=/path/to/first.mp4 \
+  evaluation.target=/path/to/second.mp4 \
+  evaluation.output_dir=runs/compare-stage1
+```
+
+显式提供两个视频时无需配置数据目录或任务列表。评估会检查它们与检查点记录的训练文件
+是否重叠，但任意文件路径本身无法证明它们属于未见过的任务。
+
+也可以按 held-out 任务批量生成结果：
+
+```bash
+python -m video_rl_pair.evaluate --config-name franka \
+  evaluation.checkpoint=runs/franka-dinov3-stage1/last.pt \
+  evaluation.output_dir=runs/franka-stage1-dtw \
+  evaluation.max_pairs_per_task=2
+```
+
+评估输出包含：
+
+- `report.json`：视频路径、采样时间戳、完整相似度矩阵、代价矩阵、DTW 路径与路径代价。
+- `index.html`：本地图片浏览入口。
+- 每对视频的图片子目录：按 DTW 路径顺序排列的匹配帧 PNG 图片序列。
+
+`evaluation.positions=32` 控制采样密度，可增大；`chunk_size=8` 控制每次编码多少帧；
+`image_size=512` 控制报告中的图片面板大小，与网络输入分辨率无关。
+输出目录必须是新的，避免不同实验结果混在一起。对比 baseline、stage1、stage2 时保持
+视频对、采样数量和预处理相同。
+
+**这是定性对齐检查，不是语义准确率。** DTW 自带时间顺序与首尾约束；特征坍缩也可能
+生成看似平滑的路径。应逐对查看同一时刻的动作阶段是否对应，不用较低路径代价代替语义
+正确性；不同编码器的相似度尺度也可能不同。需要准确率时，另行添加独立的事件/阶段标注。
+
+## 损失定义与代码入口
+
+对于 L2 归一化后的 X、Y，先构造行归一化的对比匹配代价：
+
+```text
+C[i,j] = -log softmax_j(cosine(X[i],Y[j]) / beta)
+R[i,j] = C[i,j] + smoothMin(R[i-1,j-1], R[i-1,j], R[i,j-1])
+smoothMin(r) = sum(softmax(-r/gamma) * r)
+```
+
+此处 smoothMin 是加权平均，不是 log-sum-exp 版本。
+反向匹配需重新计算 `R_yx`，不能用 `R_xy.T` 替代。
+
+```text
+p_xy = softmax(-R_xy / alpha)
+p_yx = softmax(-R_yx / alpha)
+cycle     = -sum_i log(sum_j p_xy[i,j] * p_yx[j,i])
+alignment = R_xy[-1,-1] + R_yx[-1,-1]
+loss      = cycle + 0.1 * alignment + l2_weight * head_squared_L2
+```
+
+默认 `beta=gamma=0.1`、`alpha=1`。时间维求和、视频对之间平均；增加采样长度会改变损失
+尺度，不能直接比较不同长度的原始 loss。数学定义保持独立于 encoder。
+
+| 文件 | 内容 |
 | --- | --- |
-| `mean_cosine` | Similarity at selected matches; collapsed embeddings can score highly |
-| `tau_b` | Temporal ordering of matches, with ties handled; null if all targets tie |
-| `unique_target_fraction` | Fraction of target moments selected at least once |
-| `cycle_time_error` | Mean return-to-source timestamp error divided by source duration; lower is more self-consistent |
-| `embedding_spread` | Mean squared distance of normalized embeddings from their centroid; zero means complete collapse |
-
-**These are diagnostics, not semantic matching accuracy.** A timestamp-only method
-or DTW can have excellent ordering without matching the correct event. Inspect the
-frame pairs, compare initialization and timestamp baselines, and add annotated
-events or phases later if semantic accuracy is needed. Within each task, all directed
-pair results have equal weight; macro averages give each task equal weight. Undefined
-tau values are excluded with their coverage count reported. Do not select hyperparameters
-or checkpoints using the seven held-out tasks.
-
-The checkpoint records training task IDs, resolved pair paths, file sizes and
-modification times. Evaluation checks held-out tasks against this provenance when
-present. Older checkpoints lack it and report `training_provenance_checked=false`.
-Use a fresh evaluation output directory to avoid overwriting previous comparisons.
-
-### Visually inspect a round trip and upcoming progression
-
-Run the usual evaluation command with a trained checkpoint and a fresh output
-directory. The viewer is generated automatically; no web server is required.
-For a denser sampling grid and a longer initial chunk, add these overrides:
+| `src/video_rl_pair/model.py` | CLS 编码、投影头与冻结策略 |
+| `src/video_rl_pair/losses.py` | 可微匹配代价、smoothDTW、GCC |
+| `src/video_rl_pair/video.py` / `data.py` | 解码、采样、填充长度与视频对加载 |
+| `src/video_rl_pair/trainer.py` | 参数更新、阶段初始化与恢复 |
+| `src/video_rl_pair/matching.py` | 余弦代价与完整 DTW 路径 |
+| `src/video_rl_pair/evaluation.py` / `visual_report.py` | 图片序列与报告 |
+| `src/video_rl_pair/conf/` | Hydra 配置 |
 
 ```bash
-uv run python -m video_rl_pair.evaluate \
-  data.root=/path/to/dataset \
-  'data.train_tasks=[task_01,task_02]' 'data.eval_tasks=[task_03]' \
-  evaluation.checkpoint=runs/mp4-run/last.pt \
-  evaluation.output_dir=runs/mp4-run/progression-check \
-  evaluation.positions=80 evaluation.progression_horizon=8
+pytest -q
+python -m video_rl_pair.train --config-name franka --cfg job
 ```
 
-Open `runs/mp4-run/progression-check/progression.html`. Choose a pair, the source
-robot video, and a matching method. Select the query moment `t`, then step or play
-the chunk. The three panels show the fixed query `R[t]`, the intermediate
-demonstration `D[q+i]`, and the retrieved robot moment `R[reverse[q+i]]`, where
-`q = forward[t]`. The offset is applied on the demonstration timeline, inside the
-reverse lookup. Switching methods keeps the same source query. Swapping direction
-lets either recording act as the source robot video.
-
-The reverse indices come from matching in the opposite direction, not from
-inverting the forward assignments. The starting return `t_0 = reverse[q]` and its
-timestamp error remain visible while the chunk advances. Inspect the intermediate
-demonstration as well as the returned robot: a perfect round trip can still connect
-different task stages. For later steps, compare `D[q+i]` with `R[t_i]`; they should
-show corresponding stages, not necessarily resemble the fixed starting frame.
-
-All indices refer to the **sampled evaluation grid**, not consecutive original
-MP4 frames. Original timestamps in seconds are displayed. `evaluation.positions`
-controls the grid density; the sampling interval may differ between videos.
-Playback advances sampled moments for inspection, not at the recording's native
-frame rate. The chunk shortens at the demonstration's end instead of padding with
-repeated final frames. Nearest-neighbor matches may jump backward or repeat robot
-moments; the viewer preserves these results so failures stay visible.
-
-Nearest neighbor exposes embedding similarity, DTW adds temporal ordering, and
-normalized time supplies an encoder-free reference. To assess training's benefit,
-compare against the initialization evaluation described above using the same pairs
-and sampling settings. These are retrieved recorded images, not generated future
-observations. The report embeds JPEGs up to 256 pixels per side, bounded by the
-encoder's input resolution; it contains no annotations or semantic accuracy score.
-`evaluation.visual_pairs_per_task` controls how many pairs are available in the
-viewer; setting it to zero produces an empty viewer while numerical evaluation
-continues.
-
-## Relation to the paper and reference
-
-This implementation follows the equations in the supplied text. In contrast, the
-author's release normalizes along axis 0 and feeds cycle probabilities to a
-logits-based cross-entropy with label smoothing and a temporal mean. Here source
-rows normalize over destinations, the cycle is negative log return probability,
-and time is summed. These choices are explicit; numerical identity with the released
-training loss or its historical scores is not claimed.
-
-The paper's pretrained only-BN experiments require appropriate pretrained weights.
-Scratch initialization here is a separate training setting. PyTorch initialization,
-BN running-variance updates, larger batches, and mixed precision can also affect
-results. No dataset results or full GPU training results are bundled.
-
-References: [author's repository](https://github.com/hadjisma/VideoAlignment),
-[ResNet-v2 architecture source](https://github.com/keras-team/keras-applications/blob/master/keras_applications/resnet_common.py),
-[Hydra configuration](https://hydra.cc/docs/intro/),
-[PyTorch distributed launch](https://docs.pytorch.org/docs/stable/elastic/run.html).
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution and
-[VALIDATION.md](VALIDATION.md) for observed checks and remaining verification.
+测试使用小型本地模型和合成视频检查梯度、采样、恢复与 DTW 输出，不下载正式预训练权重。
+旧架构检查点不兼容本次网络；已有 `runs/` 与 `checkpoints/` 文件保留。
+方法依据：[Hadji et al., CVPR 2021](https://arxiv.org/abs/2105.05217)。
+预训练模型依据：[DINOv3 官方仓库](https://github.com/facebookresearch/dinov3)。

@@ -104,23 +104,28 @@ class AlignmentLoss(nn.Module):
             cycle=cycle,
         )
 
-    def from_batch(self, embeddings: Tensor) -> LossTerms:
-        """Pair sequence 0 against each other same-action sequence.
-
-        A local batch [B,T,D] yields B-1 pairs. DDP averages losses across
-        ranks; it does not create pairs between different ranks.
-        """
-        if embeddings.ndim != 3 or embeddings.shape[0] < 2:
-            message = "Expected embeddings [B,T,D] with at least two same-action videos."
-            raise ValueError(message)
-        anchors = embeddings[:1].expand(embeddings.shape[0] - 1, -1, -1)
-        terms: LossTerms = self(anchors, embeddings[1:])
-        return terms
-
-    def from_pairs(self, embeddings: Tensor) -> LossTerms:
-        """Compare only supplied pairs [P,2,T,D], even across different tasks."""
+    def from_pairs(self, embeddings: Tensor, lengths: Tensor | None = None) -> LossTerms:
+        """Compare pairs [P,2,T,D], removing padding before softmax and dynamic programming."""
         if embeddings.ndim != 4 or embeddings.shape[0] < 1 or embeddings.shape[1] != 2:
             message = "Expected paired embeddings [P,2,T,D]."
             raise ValueError(message)
-        terms: LossTerms = self(embeddings[:, 0], embeddings[:, 1])
-        return terms
+        if lengths is None:
+            return self(embeddings[:, 0], embeddings[:, 1])
+        if (
+            lengths.shape != embeddings.shape[:2]
+            or lengths.dtype != torch.long
+            or not bool(((lengths >= 2) & (lengths <= embeddings.shape[2])).all())
+        ):
+            msg = "Expected valid sequence lengths [P,2], each between 2 and T."
+            raise ValueError(msg)
+        if bool((lengths == embeddings.shape[2]).all()):
+            return self(embeddings[:, 0], embeddings[:, 1])
+        terms = [
+            self(pair[0, : int(length[0])], pair[1, : int(length[1])])
+            for pair, length in zip(embeddings, lengths, strict=True)
+        ]
+        return LossTerms(
+            total=torch.stack([term.total for term in terms]).mean(),
+            alignment=torch.stack([term.alignment for term in terms]).mean(),
+            cycle=torch.stack([term.cycle for term in terms]).mean(),
+        )

@@ -2,9 +2,6 @@ defaults:
   - config
   - _self_
 
-train:
-  batch_size: 2
-
 data:
   root: ???
   train_tasks: []
@@ -14,12 +11,11 @@ data:
 evaluation:
   enabled: true
   checkpoint: null
-  allow_initialization: false
+  source: null
+  target: null
   output_dir: ${train.output_dir}/evaluation
-  methods: [nearest, dtw]
-  positions: 40
+  positions: 32
   chunk_size: 8
-  max_pairs_per_task: 20
-  visual_pairs_per_task: 2
-  progression_horizon: 8
+  max_pairs_per_task: 2
+  image_size: 512
   seed: 42

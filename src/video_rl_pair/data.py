@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from itertools import combinations, islice
 from pathlib import Path
-from typing import Literal, Self, assert_never
+from typing import Literal, NamedTuple, Self, assert_never
 
 import torch
 from pydantic import Field, model_validator
@@ -119,8 +119,15 @@ def discover_pairs(
     assert_never(split)
 
 
+class PairBatch(NamedTuple):
+    """Paired frames plus effective lengths, before or after default collation."""
+
+    clips: Tensor
+    lengths: Tensor
+
+
 @dataclass(frozen=True)
-class _PairDataset(Dataset[Tensor]):
+class _PairDataset(Dataset[PairBatch]):
     pairs: tuple[VideoPair, ...]
     settings: ExperimentConfig
     epoch: int
@@ -129,20 +136,20 @@ class _PairDataset(Dataset[Tensor]):
         return len(self.pairs)
 
     @override
-    def __getitem__(self, index: int) -> Tensor:
+    def __getitem__(self, index: int) -> PairBatch:
         pair = self.pairs[index]
         seed = self.settings.train.seed + 2 * (self.epoch * len(self.pairs) + index)
-        return torch.stack(
-            (
-                sample_video(pair.first, self.settings, seed).clips,
-                sample_video(pair.second, self.settings, seed + 1).clips,
-            )
+        first = sample_video(pair.first, self.settings, seed)
+        second = sample_video(pair.second, self.settings, seed + 1)
+        return PairBatch(
+            torch.stack((first.clips, second.clips)),
+            torch.tensor([first.valid_length, second.valid_length]),
         )
 
 
 def make_pair_batches(
     settings: ExperimentConfig, runtime: Runtime, start_step: int, *, data: PairDataConfig
-) -> Iterable[Tensor]:
+) -> Iterable[PairBatch]:
     """Shard complete pairs, drop partial batches, and resume at a microstep boundary."""
     if settings.train.batch_size % 2:
         message = "train.batch_size is videos per rank and must be even."
@@ -170,7 +177,7 @@ def make_pair_batches(
         )
         sampler.set_epoch(epoch)
         batches = BatchSampler(sampler, pairs_per_batch, drop_last=True)
-        loader: Iterable[Tensor] = DataLoader(
+        loader: Iterable[PairBatch] = DataLoader(
             dataset,
             batch_sampler=list(islice(batches, offset, None)),
             num_workers=data.num_workers,

@@ -24,7 +24,7 @@ def main(config: DictConfig) -> None:
     has_data = config.get("data") is not None
     if config.batch_source is None and not has_data:
         message = (
-            "Use --config-name pairs for MP4 data, --config-name demo for random tensors, "
+            "Use --config-name pairs for MP4 data, "
             "or set batch_source._target_ to your own iterable factory."
         )
         raise ValueError(message)
@@ -50,6 +50,7 @@ def main(config: DictConfig) -> None:
     with ExitStack() as tracking:
         with distributed_runtime(settings.train) as runtime:
             trainer = Trainer(settings, runtime, provenance)
+            settings = trainer.config
             initial_step = trainer.step
             run = tracking.enter_context(tracking_run(config, runtime))
             batches = (

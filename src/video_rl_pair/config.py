@@ -1,26 +1,17 @@
 # Copyright (c) 2026 video-rl-pair contributors.
 """Validate Hydra's composed configuration once, at the application boundary."""
 
+import json
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 
 class Settings(BaseModel):
     """Immutable configuration shared by the CLI and the Python training API."""
 
     model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True, extra="forbid")
-
-
-class WeightConfig(Settings):
-    """Map a compatible checkpoint to a backbone or complete encoder."""
-
-    path: Path | None = None
-    scope: Literal["backbone", "encoder"] = "backbone"
-    key: str | None = None
-    prefix: str | None = None
-    exclude_prefixes: tuple[str, ...] = ()
 
 
 class WandbConfig(Settings):
@@ -46,15 +37,21 @@ class WandbConfig(Settings):
 
 
 class ModelConfig(Settings):
-    """Encoder architecture and optional initialization, independent of resume."""
+    """CLS-only DINOv3 architecture and which parameters are trained."""
 
-    backbone: Literal["resnet50_v2", "resnet50_v1"] = "resnet50_v2"
-    ckpt: WeightConfig = Field(default_factory=WeightConfig)
-    train_backbone: Literal["all", "only_bn", "frozen"] = "all"
-    conv_channels: int = Field(default=512, gt=0)
-    fc_channels: int = Field(default=512, gt=0)
+    source: Path = Path("checkpoints/dinov3-vitb16-pretrain-lvd1689m")
+    mode: Literal["baseline", "stage1", "stage2"] = "stage1"
+    hidden_dim: int = Field(default=512, gt=0)
     embedding_dim: int = Field(default=128, gt=0)
-    dropout: float = Field(default=0.1, ge=0, lt=1)
+    unfreeze_last_n: int = Field(default=2, ge=1)
+    # Resolved into every training checkpoint, enabling offline reconstruction.
+    backbone_config: dict[str, JsonValue] | None = None
+
+    @field_validator("backbone_config", mode="before")
+    @classmethod
+    def json_architecture(cls, value: object) -> object:
+        """Normalize Hugging Face integer label keys before checkpoint round trips."""
+        return None if value is None else json.loads(json.dumps(value))
 
 
 class LossConfig(Settings):
@@ -70,29 +67,36 @@ class LossConfig(Settings):
 class TrainConfig(Settings):
     """One optimizer step can accumulate multiple local batches on each rank."""
 
-    max_steps: int = Field(default=150_000, gt=0)
-    batch_size: int = Field(default=4, ge=2)
+    max_steps: int = Field(default=6_000, gt=0)
+    batch_size: int = Field(default=2, ge=2)
     accumulate: int = Field(default=1, gt=0)
     learning_rate: float = Field(default=1e-4, gt=0)
+    backbone_learning_rate: float = Field(default=1e-5, gt=0)
     l2_weight: float = Field(default=1e-5, ge=0)
     precision: Literal["fp32", "bf16", "fp16"] = "fp32"
     device: Literal["auto", "cpu", "cuda"] = "auto"
-    sync_batchnorm: bool = True
-    grad_clip: float | None = Field(default=None, gt=0)
+    grad_clip: float | None = Field(default=1.0, gt=0)
     seed: int = Field(default=42, ge=0)
     log_every: int = Field(default=100, gt=0)
-    save_every: int = Field(default=30_000, gt=0)
+    save_every: int = Field(default=1_200, gt=0)
     output_dir: Path = Path("runs/default")
     resume: Path | None = None
+    init_checkpoint: Path | None = None
+
+    @model_validator(mode="after")
+    def validate_initialization(self) -> "TrainConfig":
+        """Distinguish a weights-only stage transition from a complete resume."""
+        if self.resume is not None and self.init_checkpoint is not None:
+            message = "Use either train.resume or train.init_checkpoint, not both."
+            raise ValueError(message)
+        return self
 
 
 class InputConfig(Settings):
-    """Expected clip shape; a data pipeline must construct this context."""
+    """Number of sampled frames and square image size; no temporal context head."""
 
-    positions: int = Field(default=20, ge=2)
-    context_frames: int = Field(default=2, gt=0)
-    context_stride: int = Field(default=15, gt=0)
-    image_size: int = Field(default=224, ge=16)
+    positions: int = Field(default=32, ge=2)
+    image_size: int = Field(default=224, ge=16, multiple_of=16)
 
 
 class ExperimentConfig(Settings):

@@ -1,110 +1,105 @@
 # Copyright (c) 2026 video-rl-pair contributors.
-"""Frames -> Conv4c -> temporal/spatial head -> unit-length embeddings."""
+"""Shared DINOv3 image encoder: one normalized CLS embedding per video frame."""
 
-from collections import OrderedDict
-from typing import Self, assert_never, final
+from typing import Self, final
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional
-from torchvision.models import resnet50
+from transformers import AutoModel, DINOv3ViTConfig, DINOv3ViTModel
 from typing_extensions import override
 
-from video_rl_pair.backbone import ResNet50V2
 from video_rl_pair.config import ModelConfig
-from video_rl_pair.weights import initialize_weights
 
 
 @final
 class VideoEncoder(nn.Module):
-    """Encode B videos at T moments using K context frames per moment."""
+    """Raw CLS baseline, head-only adaptation, or head plus backbone-suffix tuning."""
 
     def __init__(self, config: ModelConfig, *, initialize: bool = True) -> None:
-        """Build the encoder, optionally initialize weights, and select trainable layers."""
+        """Load local pretrained weights or reconstruct from checkpoint architecture."""
         super().__init__()
-        self.config = config
-        match config.backbone:
-            case "resnet50_v2":
-                self.backbone = ResNet50V2()
-            case "resnet50_v1":
-                full = resnet50(weights=None)
-                self.backbone = nn.Sequential(
-                    OrderedDict(
-                        (name, layer)
-                        for name, layer in full.named_children()
-                        if name not in {"layer4", "avgpool", "fc"}
-                    )
-                )
-            case unreachable:
-                assert_never(unreachable)
-
-        channels, hidden = config.conv_channels, config.fc_channels
-        self.head = nn.Sequential(
-            nn.Conv3d(1024, channels, 3, padding=1),
-            nn.BatchNorm3d(channels, eps=1e-3, momentum=0.01),
-            nn.ReLU(),
-            nn.Conv3d(channels, channels, 3, padding=1),
-            nn.BatchNorm3d(channels, eps=1e-3, momentum=0.01),
-            nn.ReLU(),
-            nn.AdaptiveMaxPool3d(1),
-            nn.Flatten(),
-            nn.Dropout(config.dropout),
-            nn.Linear(channels, hidden),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, config.embedding_dim),
-        )
-        for module in self.head.modules():
-            if isinstance(module, nn.Conv3d):
-                _ = nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-                if module.bias is not None:
-                    _ = nn.init.zeros_(module.bias)
-            if isinstance(module, nn.Linear):
-                _ = nn.init.xavier_uniform_(module.weight)
-                _ = nn.init.zeros_(module.bias)
-
         if initialize:
-            target = self.backbone if config.ckpt.scope == "backbone" else self
-            initialize_weights(target, config.ckpt)
-        _ = self.backbone.requires_grad_(config.train_backbone == "all")
-        for layer in self.backbone.modules():
-            if isinstance(layer, nn.BatchNorm2d):
-                _ = layer.requires_grad_(config.train_backbone != "frozen")
+            if not config.source.is_dir():
+                message = (
+                    f"Missing local DINOv3 model directory: {config.source}. "
+                    "Download the model first; training never downloads weights."
+                )
+                raise FileNotFoundError(message)
+            backbone = AutoModel.from_pretrained(
+                str(config.source), local_files_only=True, use_safetensors=True
+            )
+            if not isinstance(backbone, DINOv3ViTModel):
+                message = "model.source must contain a DINOv3 ViT checkpoint."
+                raise ValueError(message)
+            self.backbone = backbone
+        else:
+            if config.backbone_config is None:
+                message = "Checkpoint reconstruction requires model.backbone_config."
+                raise ValueError(message)
+            if config.backbone_config.get("model_type") != "dinov3_vit":
+                message = "Checkpoint backbone_config must describe a DINOv3 ViT."
+                raise ValueError(message)
+            backbone_config = DINOv3ViTConfig.from_dict(config.backbone_config)
+            self.backbone = DINOv3ViTModel(backbone_config)
+
+        self.resolved_config = ModelConfig.model_validate(
+            {**config.model_dump(), "backbone_config": self.backbone.config.to_dict()}
+        )
+        self.config = self.resolved_config
+        feature_dim = self.backbone.config.hidden_size
+        self.head = (
+            nn.Identity()
+            if config.mode == "baseline"
+            else nn.Sequential(
+                nn.Linear(feature_dim, config.hidden_dim),
+                nn.GELU(),
+                nn.Linear(config.hidden_dim, config.embedding_dim),
+            )
+        )
+        _ = self.backbone.requires_grad_(requires_grad=False)
+        if config.mode == "stage2":
+            if config.unfreeze_last_n > len(self.backbone.layer):
+                message = "model.unfreeze_last_n exceeds the backbone's block count."
+                raise ValueError(message)
+            for block in self.backbone.layer[-config.unfreeze_last_n :]:
+                _ = block.requires_grad_(requires_grad=True)
+            _ = self.backbone.norm.requires_grad_(requires_grad=True)
+        # Embeddings (including the unused mask token) remain frozen in every mode.
+        _ = self.train()
 
     @override
     def train(self, mode: bool = True) -> Self:
-        """Keep frozen backbone running statistics fixed as well as its weights."""
+        """Keep the frozen prefix and positional augmentation deterministic."""
         _ = super().train(mode)
-        if self.config.train_backbone == "frozen":
-            _ = self.backbone.eval()
+        _ = self.backbone.eval()
+        if mode and self.config.mode == "stage2":
+            for block in self.backbone.layer[-self.config.unfreeze_last_n :]:
+                _ = block.train()
+            _ = self.backbone.norm.train()
         return self
 
     @override
     def forward(self, clips: Tensor) -> Tensor:
-        """Map [B,T,K,3,H,W] -> [B,T,D]; pool over context, never over T.
-
-        Context must end at the represented moment (no future frames).
-        For K=2 and stride=15, use [max(t-15,0), t].
-        """
-        if clips.ndim != 6 or clips.shape[3] != 3:
-            message = "Expected clips shaped [B,T,K,3,H,W]."
+        """Map normalized RGB [B,T,3,H,W] to unit embeddings [B,T,D]."""
+        if clips.ndim != 5 or clips.shape[2] != 3 or min(clips.shape) < 1:
+            message = "Expected nonempty clips shaped [B,T,3,H,W]."
             raise ValueError(message)
-        batch, positions, context, channels, height, width = clips.shape
-        frames = clips.reshape(batch * positions * context, channels, height, width)
-        features: Tensor = self.backbone(frames)
-        _, channels, height, width = features.shape
-        contexts = features.reshape(batch * positions, context, channels, height, width)
-        embedding: Tensor = self.head(contexts.transpose(1, 2))
-        return functional.normalize(embedding.float(), dim=-1).reshape(batch, positions, -1)
+        batch, positions, channels, height, width = clips.shape
+        patch_size = self.backbone.config.patch_size
+        if height % patch_size or width % patch_size:
+            message = "Image dimensions must be multiples of the backbone patch size."
+            raise ValueError(message)
+        frames = clips.reshape(batch * positions, channels, height, width)
+        outputs = self.backbone(pixel_values=frames)
+        # Token zero is CLS; register and patch tokens are never pooled into it here.
+        cls: Tensor = outputs.last_hidden_state[:, 0, :]
+        embeddings: Tensor = self.head(cls)
+        return functional.normalize(embeddings.float(), dim=-1).reshape(batch, positions, -1)
 
     def regularization(self) -> Tensor:
-        """Apply squared L2 to head kernels and biases, excluding BN."""
-        terms = [
-            parameter.square().sum()
-            for module in self.head
-            if isinstance(module, (nn.Conv3d, nn.Linear))
-            for parameter in module.parameters()
-        ]
+        """Squared L2 of projection weights and biases; no penalty on pretrained weights."""
+        terms = [parameter.square().sum() for parameter in self.head.parameters()]
+        if not terms:
+            return next(self.backbone.parameters()).new_zeros(())
         return torch.stack(terms).sum()

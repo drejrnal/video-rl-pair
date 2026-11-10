@@ -15,7 +15,8 @@ dependencies = [
   "pydantic>=2,<3",
   "typing-extensions>=4.12",
   "av>=14,<17",
-  "pillow>=10,<13",
+  "pillow>=10.1,<13",
+  "transformers==4.57.6",
 ]
 
 [project.scripts]
@@ -32,7 +33,7 @@ dev = ["pytest>=8", "ruff>=0.8", "basedpyright>=1.21", "build>=1"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-video_rl_pair = ["conf/*.yaml", "conf/*/*.yaml", "assets/*", "py.typed"]
+video_rl_pair = ["conf/*.yaml", "conf/*/*.yaml", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

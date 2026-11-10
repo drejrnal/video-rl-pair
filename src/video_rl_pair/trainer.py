@@ -1,9 +1,5 @@
 # Copyright (c) 2026 video-rl-pair contributors.
-"""Optimization for anchor batches [B,T,K,C,H,W] or explicit MP4 pairs.
-
-Paired batches [P,2,T,K,C,H,W] compare only the two videos within each pair.
-The unpaired interface retains the original same-task anchor pairing.
-"""
+"""Optimize CLS sequence alignment, excluding padded frames from every loss term."""
 
 import json
 import logging
@@ -18,6 +14,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from video_rl_pair.checkpoint import Checkpoint, atomic_save, gather_rank_states, restore_rank_state
 from video_rl_pair.config import ExperimentConfig
+from video_rl_pair.data import PairBatch
 from video_rl_pair.distributed import Runtime
 from video_rl_pair.losses import AlignmentLoss
 from video_rl_pair.model import VideoEncoder
@@ -33,23 +30,40 @@ class Trainer:
         self, config: ExperimentConfig, runtime: Runtime, data_provenance: str | None = None
     ) -> None:
         """Initialize the model on its rank, then restore full state when resuming."""
-        self.config = config
+        if config.model.mode == "baseline":
+            msg = "baseline has no trainable parameters; use video_rl_pair.evaluate."
+            raise ValueError(msg)
         self.runtime = runtime
         self.data_provenance = data_provenance
         self.step = 0
         _ = torch.manual_seed(config.train.seed)
-        if (
-            config.train.resume is None
-            and config.model.train_backbone != "all"
-            and config.model.ckpt.path is None
-        ):
-            message = "only_bn/frozen requires model.ckpt.path; use all for scratch training."
-            raise ValueError(message)
-        self.encoder = VideoEncoder(config.model, initialize=config.train.resume is None).to(
-            runtime.device
-        )
-        if config.train.sync_batchnorm and runtime.world_size > 1 and runtime.device.type == "cuda":
-            _ = nn.SyncBatchNorm.convert_sync_batchnorm(self.encoder)
+        checkpoint_path = config.train.resume or config.train.init_checkpoint
+        checkpoint = None
+        if checkpoint_path is not None:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            if checkpoint["version"] != 2:
+                msg = "Expected a DINOv3 checkpoint (version 2)."
+                raise ValueError(msg)
+            old = ExperimentConfig.model_validate_json(checkpoint["config"])
+            if config.train.init_checkpoint is not None and (
+                config.model.mode != "stage2" or old.model.mode not in {"stage1", "stage2"}
+            ):
+                msg = "init_checkpoint is for stage2, from a stage1/stage2 checkpoint."
+                raise ValueError(msg)
+            if checkpoint.get("data_provenance") != data_provenance:
+                msg = "Checkpoint training pairs and file metadata must match this run."
+                raise ValueError(msg)
+            config = config.model_copy(
+                update={
+                    "model": config.model.model_copy(
+                        update={"backbone_config": old.model.backbone_config}
+                    )
+                }
+            )
+        self.encoder = VideoEncoder(config.model, initialize=checkpoint is None).to(runtime.device)
+        self.config = config.model_copy(update={"model": self.encoder.resolved_config})
+        if checkpoint is not None:
+            _ = self.encoder.load_state_dict(checkpoint["model"], strict=True)
         self.model = (
             DistributedDataParallel(
                 self.encoder,
@@ -60,11 +74,18 @@ class Trainer:
             else self.encoder
         )
         self.loss = AlignmentLoss(config.loss)
-        self.optimizer = torch.optim.Adam(
-            [p for p in self.encoder.parameters() if p.requires_grad],
-            lr=config.train.learning_rate,
-            eps=1e-7,
-        )
+        groups = [
+            {
+                "params": [p for p in self.encoder.head.parameters() if p.requires_grad],
+                "lr": config.train.learning_rate,
+            }
+        ]
+        backbone_parameters = [p for p in self.encoder.backbone.parameters() if p.requires_grad]
+        if backbone_parameters:
+            groups.append(
+                {"params": backbone_parameters, "lr": config.train.backbone_learning_rate}
+            )
+        self.optimizer = torch.optim.Adam(groups, eps=1e-7)
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.train.precision == "fp16")
         self.dtype = torch.bfloat16 if config.train.precision == "bf16" else torch.float16
         _ = torch.manual_seed(config.train.seed + runtime.rank)
@@ -73,7 +94,7 @@ class Trainer:
 
     def fit(
         self,
-        batches: Iterable[Tensor],
+        batches: Iterable[Tensor | PairBatch],
         *,
         log_metrics: Callable[[Mapping[str, float | int]], None] | None = None,
     ) -> None:
@@ -107,8 +128,7 @@ class Trainer:
                 if batch is None:
                     message = "Batch source is exhausted."
                     raise RuntimeError(message)
-                paired = batch.ndim == 7
-                batch = self.prepare_batch(batch)
+                batch, lengths = self.prepare_batch(batch)
                 synchronize = microstep == cfg.accumulate - 1
                 context = (
                     self.model.no_sync()
@@ -123,11 +143,7 @@ class Trainer:
                     ):
                         embeddings: Tensor = self.model(batch.to(runtime.device, non_blocking=True))
                     # Keep accumulated costs and cycle probabilities out of reduced precision.
-                    terms = (
-                        self.loss.from_pairs(embeddings.float().unflatten(0, (-1, 2)))
-                        if paired
-                        else self.loss.from_batch(embeddings.float())
-                    )
+                    terms = self.loss.from_pairs(embeddings.float().unflatten(0, (-1, 2)), lengths)
                     penalty = cfg.l2_weight * self.encoder.regularization()
                     total = terms.total + penalty
                     runtime.require_all(bool(torch.isfinite(total)), "Non-finite training loss.")
@@ -166,62 +182,75 @@ class Trainer:
             if self.step % cfg.save_every == 0 or self.step == cfg.max_steps:
                 self.save()
 
-    def prepare_batch(self, batch: Tensor) -> Tensor:
-        """Validate the pair contract collectively, then flatten videos for encoding."""
+    def prepare_batch(self, batch: Tensor | PairBatch) -> tuple[Tensor, Tensor]:
+        """Validate fixed storage shapes and effective lengths before DDP forward."""
         cfg = self.config
-        tail = (
+        if isinstance(batch, PairBatch):
+            clips, lengths = batch
+        else:
+            clips = batch
+            lengths = torch.full((cfg.train.batch_size // 2, 2), cfg.input.positions)
+        expected = (
+            cfg.train.batch_size // 2,
+            2,
             cfg.input.positions,
-            cfg.input.context_frames,
             3,
             cfg.input.image_size,
             cfg.input.image_size,
         )
-        paired = batch.ndim == 7
-        expected = (
-            (cfg.train.batch_size // 2, 2, *tail) if paired else (cfg.train.batch_size, *tail)
-        )
         self.runtime.require_all(
-            tuple(batch.shape) == expected
-            and batch.is_floating_point()
-            and (not paired or cfg.train.batch_size % 2 == 0),
-            f"Expected floating clips {expected}; paired batches require even batch_size.",
+            tuple(clips.shape) == expected
+            and clips.is_floating_point()
+            and cfg.train.batch_size % 2 == 0
+            and tuple(lengths.shape) == expected[:2]
+            and lengths.dtype == torch.long
+            and bool(((lengths >= 2) & (lengths <= cfg.input.positions)).all()),
+            f"Expected paired floating clips {expected} and valid lengths [P,2].",
         )
-        return batch.flatten(0, 1) if paired else batch
+        return clips.flatten(0, 1), lengths
 
     def save(self) -> None:
-        """Save all training state; each rank must enter this method."""
+        """Retain a step snapshot and refresh last.pt; all ranks must enter."""
         states = gather_rank_states(self.encoder, self.runtime)
         if self.runtime.rank == 0:
-            atomic_save(
-                {
-                    "version": 1,
-                    "step": self.step,
-                    "config": self.config.model_dump_json(),
-                    "model": self.encoder.state_dict(),
-                    "optimizer": self.optimizer.state_dict(),
-                    "scaler": self.scaler.state_dict(),
-                    "ranks": states,
-                    "data_provenance": self.data_provenance,
-                },
-                self.config.train.output_dir / "last.pt",
-            )
+            payload: Checkpoint = {
+                "version": 2,
+                "step": self.step,
+                "config": self.config.model_dump_json(),
+                "model": self.encoder.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "scaler": self.scaler.state_dict(),
+                "ranks": states,
+                "data_provenance": self.data_provenance,
+            }
+            output = self.config.train.output_dir
+            atomic_save(payload, output / f"step_{self.step:06d}.pt")
+            atomic_save(payload, output / "last.pt")
 
     def restore(self, path: Path) -> None:
         """Resume a trusted local checkpoint with the same distributed topology."""
         checkpoint: Checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        if checkpoint["version"] != 1 or len(checkpoint["ranks"]) != self.runtime.world_size:
+        if checkpoint["version"] != 2 or len(checkpoint["ranks"]) != self.runtime.world_size:
             message = "Checkpoint version and world size must match this run."
             raise ValueError(message)
         old = ExperimentConfig.model_validate_json(checkpoint["config"])
         if checkpoint.get("data_provenance") != self.data_provenance:
             message = (
                 "Resume requires the same video pairs and file metadata; "
-                "use ckpt for initialization."
+                "start a new run for a different dataset."
             )
             raise ValueError(message)
-        excluded = {"max_steps", "log_every", "save_every", "output_dir", "resume"}
+        excluded = {
+            "max_steps",
+            "log_every",
+            "save_every",
+            "output_dir",
+            "resume",
+            "init_checkpoint",
+        }
         same = (
-            old.model.model_dump(exclude={"ckpt"}) == self.config.model.model_dump(exclude={"ckpt"})
+            old.model.model_dump(exclude={"source"})
+            == self.config.model.model_dump(exclude={"source"})
             and old.input == self.config.input
             and old.loss == self.config.loss
             and old.train.model_dump(exclude=excluded)
@@ -234,6 +263,9 @@ class Trainer:
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.step = checkpoint["step"]
+        if self.step > self.config.train.max_steps:
+            msg = "train.max_steps cannot precede the resumed optimizer step."
+            raise ValueError(msg)
         state = checkpoint["ranks"][self.runtime.rank]
         if state is None:
             message = "Checkpoint is missing this rank's state."

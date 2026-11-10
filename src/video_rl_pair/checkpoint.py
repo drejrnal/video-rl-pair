@@ -1,5 +1,5 @@
 # Copyright (c) 2026 video-rl-pair contributors.
-"""Atomic checkpoint files, including per-rank torch RNG and BN buffers."""
+"""Atomic checkpoint files, including per-rank torch RNG and model buffers."""
 
 from collections.abc import Mapping
 from pathlib import Path

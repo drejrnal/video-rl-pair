@@ -1,16 +1,14 @@
 defaults:
-  - model: paper
+  - model: dinov3
   - loss: paper
-  - train: paper
+  - train: default
   - wandb: default
   - override hydra/job_logging: stdout
   - override hydra/hydra_logging: disabled
   - _self_
 
 input:
-  positions: 20
-  context_frames: 2
-  context_stride: 15
+  positions: 32
   image_size: 224
 
 batch_source: null

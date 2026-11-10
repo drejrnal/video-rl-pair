@@ -1,0 +1,7 @@
+# Download this snapshot explicitly with scripts/download_dinov3.sh.
+source: checkpoints/dinov3-vitb16-pretrain-lvd1689m
+mode: stage1
+hidden_dim: 512
+embedding_dim: 128
+unfreeze_last_n: 2
+backbone_config: null
